@@ -39,6 +39,9 @@ db.exec(`
     voice_name  TEXT,                        -- audio attachment (NULL if none)
     video_name  TEXT,                        -- video attachment (NULL if none)
     file_name   TEXT,                        -- general file attachment (NULL if none)
+    expect_end_date TEXT,                    -- expected end date YYYY-MM-DD (NULL if none)
+    archived    INTEGER NOT NULL DEFAULT 0,  -- 1 = moved to the Archive page
+    uuid        TEXT,                        -- stable cross-device identity (sync dedupe)
     created_at  TEXT    NOT NULL             -- ISO timestamp of insertion
   );
 
@@ -50,6 +53,7 @@ db.exec(`
     voice_name  TEXT,                        -- audio attachment (NULL if none)
     video_name  TEXT,                        -- video attachment (NULL if none)
     file_name   TEXT,                        -- general file attachment (NULL if none)
+    uuid        TEXT,                        -- stable cross-device identity (sync dedupe)
     created_at  TEXT    NOT NULL             -- ISO timestamp of insertion (auto)
   );
 
@@ -67,6 +71,22 @@ db.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_notes_tags_tag ON notes_tags(tag_id);
+
+  -- Multi-attachments: a note (tracking or taking) can have any number of attachments.
+  -- The legacy single-slot columns (image_name/voice_name/video_name/file_name) are kept
+  -- and treated as the first attachment of their kind, so old data keeps working.
+  CREATE TABLE IF NOT EXISTS attachments (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    note_kind   TEXT    NOT NULL,             -- 'tracking' | 'taking'
+    note_id     INTEGER NOT NULL,
+    type        TEXT    NOT NULL,             -- 'image' | 'audio' | 'video' | 'file'
+    file_name   TEXT    NOT NULL,             -- filename in uploads/
+    original_name TEXT,                       -- user-visible filename (NULL = use file_name)
+    sort_order  INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT    NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_attachments_note ON attachments(note_kind, note_id);
 `);
 
 // Seed the default tag set for note-taking.
@@ -79,10 +99,43 @@ const DEFAULT_TAGS = ['maps', 'eating', 'personal use', 'info', 'item price', 'b
   }
 }
 
+// Migrations: add new columns to existing databases (older notes.db files).
+{
+  const cols = db.prepare("PRAGMA table_info(notes)").all().map((c) => c.name);
+  if (!cols.includes('expect_end_date')) db.exec('ALTER TABLE notes ADD COLUMN expect_end_date TEXT');
+  if (!cols.includes('archived')) db.exec('ALTER TABLE notes ADD COLUMN archived INTEGER NOT NULL DEFAULT 0');
+  if (!cols.includes('uuid')) db.exec('ALTER TABLE notes ADD COLUMN uuid TEXT');
+  const tcols = db.prepare("PRAGMA table_info(taking_notes)").all().map((c) => c.name);
+  if (!tcols.includes('uuid')) db.exec('ALTER TABLE taking_notes ADD COLUMN uuid TEXT');
+}
+
+// Migration: move legacy single-slot attachments into the attachments table (once).
+{
+  const tables = new Set(db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((r) => r.name));
+  if (tables.has('attachments')) {
+    const hasData = db.prepare('SELECT COUNT(*) AS c FROM attachments').get().c > 0;
+    if (!hasData) {
+      const ins = db.prepare(
+        'INSERT INTO attachments (note_kind, note_id, type, file_name, sort_order, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+      );
+      const migrate = (kind, table) => {
+        for (const r of db.prepare('SELECT * FROM ' + table).all()) {
+          let order = 0;
+          for (const [col, type] of [['image_name', 'image'], ['voice_name', 'audio'], ['video_name', 'video'], ['file_name', 'file']]) {
+            if (r[col]) ins.run(kind, r.id, type, r[col], order++, r.created_at || new Date().toISOString());
+          }
+        }
+      };
+      migrate('tracking', 'notes');
+      migrate('taking', 'taking_notes');
+    }
+  }
+}
+
 const stmts = {
   // Tracking notes
   insert: db.prepare(
-    'INSERT INTO notes (date, note, image_name, voice_name, video_name, file_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    'INSERT INTO notes (date, note, image_name, voice_name, video_name, file_name, expect_end_date, uuid, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
   ),
   list: db.prepare('SELECT * FROM notes ORDER BY date DESC, id DESC'),
   get: db.prepare('SELECT * FROM notes WHERE id = ?'),
@@ -90,7 +143,7 @@ const stmts = {
 
   // Taking notes
   t_insert: db.prepare(
-    'INSERT INTO taking_notes (note, image_name, voice_name, video_name, file_name, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+    'INSERT INTO taking_notes (note, image_name, voice_name, video_name, file_name, uuid, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
   ),
   t_list: db.prepare('SELECT * FROM taking_notes ORDER BY created_at DESC, id DESC'),
   t_get: db.prepare('SELECT * FROM taking_notes WHERE id = ?'),
@@ -108,6 +161,14 @@ const stmts = {
   tags_for_note: db.prepare(
     'SELECT t.name FROM tags t JOIN notes_tags nt ON nt.tag_id = t.id WHERE nt.note_id = ? ORDER BY t.name'
   ),
+
+  // Multi-attachments
+  att_insert: db.prepare(
+    'INSERT INTO attachments (note_kind, note_id, type, file_name, original_name, sort_order, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ),
+  att_list: db.prepare('SELECT * FROM attachments WHERE note_kind = ? AND note_id = ? ORDER BY sort_order, id'),
+  att_get: db.prepare('SELECT * FROM attachments WHERE id = ?'),
+  att_remove: db.prepare('DELETE FROM attachments WHERE id = ?'),
 };
 
 // ---------------------------------------------------------------------------
@@ -187,10 +248,26 @@ function parseMultipartFiles(body) {
 // can read the content-type without threading it through. (Simpler for this small app.)
 const req_global = {};
 
+// Normalize an optional date field (e.g. expect_end_date): accept YYYY-MM-DD, return null when empty/invalid.
+function normalizeDateField(v) {
+  const s = String(v ?? '').trim();
+  if (!s) return null;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  const d = new Date(s + 'T00:00:00Z');
+  return isNaN(d.getTime()) ? null : s;
+}
+
 function saveImage(buffer, ext) {
   const name = Date.now() + '-' + crypto.randomBytes(6).toString('hex') + ext;
   fs.writeFileSync(path.join(UPLOAD_DIR, name), buffer);
   return name;
+}
+
+// A note's stable cross-device identity. Generated once at creation and carried through
+// sync so the same note is never inserted twice on any device (dedupe by uuid first,
+// falling back to content-hash for notes created before uuids existed).
+function newUuid() {
+  return crypto.randomUUID();
 }
 
 // ---------------------------------------------------------------------------
@@ -203,27 +280,31 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, { notes: rows });
   }
 
-  // POST /api/notes -> create one (JSON or multipart with attachments)
+  // POST /api/notes -> create one (JSON or multipart with attachments; multiple files per type allowed)
   if (req.method === 'POST' && url.pathname === '/api/notes') {
     const contentType = req.headers['content-type'] || '';
-    let date, note;
-    const atts = { image: null, voice: null, video: null, file: null };
+    let date, note, expectEndDate;
+    // Legacy single-slot refs (first image/audio/video/file), from sync passthrough.
+    const legacyRefs = { image: null, voice: null, video: null, file: null };
+    // New multi-attachments collected from multipart file parts.
+    const newAtts = [];
 
     if (/multipart\/form-data/i.test(contentType)) {
       req_global.content_type = contentType;
-      const body = await readBody(req, MAX_IMAGE_BYTES * 4 + 1024 * 1024);
+      const body = await readBody(req, MAX_IMAGE_BYTES * 8 + 1024 * 1024);
       const fields = parseMultipartFields(body, contentType);
       date = (fields.date || '').trim();
       note = (fields.note || '').trim();
+      expectEndDate = normalizeDateField(fields.expect_end_date);
       for (const f of parseMultipartFiles(body)) {
         if (f.buffer.length === 0) continue;
         const key = ['image', 'voice', 'video', 'file'].includes(f.field) ? f.field : 'file';
-        if (!atts[key]) atts[key] = saveImage(f.buffer, f.ext);
+        newAtts.push({ type: key, buffer: f.buffer, ext: f.ext, name: f.name });
       }
-      // Passthrough: reference a file that already exists on this server (used by sync pull).
+      // Passthrough: reference files that already exist on this server (used by sync pull).
       for (const key of ['image', 'voice', 'video', 'file']) {
         const ref = (fields[key + '_url'] || '').trim();
-        if (ref && !atts[key]) atts[key] = path.basename(ref);
+        if (ref && !legacyRefs[key]) legacyRefs[key] = path.basename(ref);
       }
     } else {
       const body = await readBody(req, 1024 * 1024);
@@ -235,22 +316,25 @@ async function handleApi(req, res, url) {
       }
       date = (data.date || '').trim();
       note = (data.note || '').trim();
+      expectEndDate = normalizeDateField(data.expect_end_date);
       for (const key of ['image', 'voice', 'video', 'file']) {
         const ref = (data[key + '_url'] || '').trim();
-        if (ref && !atts[key]) atts[key] = path.basename(ref);
+        if (ref && !legacyRefs[key]) legacyRefs[key] = path.basename(ref);
       }
     }
 
     if (!date) return sendJson(res, 400, { error: 'date is required' });
-    const hasAttach = atts.image || atts.voice || atts.video || atts.file;
+    const hasAttach = newAtts.length > 0 || Object.values(legacyRefs).some(Boolean);
     if (!note && !hasAttach) {
       return sendJson(res, 400, { error: 'note text or an attachment is required' });
     }
 
     const info = stmts.insert.run(
-      date, note, atts.image, atts.voice, atts.video, atts.file, new Date().toISOString()
+      date, note, legacyRefs.image, legacyRefs.voice, legacyRefs.video, legacyRefs.file, expectEndDate, newUuid(), new Date().toISOString()
     );
-    const row = stmts.get.get(Number(info.lastInsertRowid));
+    const id = Number(info.lastInsertRowid);
+    addAttachments('tracking', id, newAtts);
+    const row = stmts.get.get(id);
     return sendJson(res, 201, { note: rowToPublic(row) });
   }
 
@@ -265,6 +349,49 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, { ok: true, id });
   }
 
+  // POST /api/notes/:id/archive -> archive or unarchive a tracking note.
+  // Body: { archived: true | false }  ->  { ok, id, archived }
+  const archMatch = /^\/api\/notes\/(\d+)\/archive$/.exec(url.pathname);
+  if (req.method === 'POST' && archMatch) {
+    const id = Number(archMatch[1]);
+    const row = stmts.get.get(id);
+    if (!row) return sendJson(res, 404, { error: 'not found' });
+    let body;
+    try { body = JSON.parse((await readBody(req, 64 * 1024)).toString('utf8') || '{}'); }
+    catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
+    const archived = body.archived ? 1 : 0;
+    db.prepare('UPDATE notes SET archived = ? WHERE id = ?').run(archived, id);
+    return sendJson(res, 200, { ok: true, id, archived: !!archived });
+  }
+
+  // POST /api/notes/:id/attachments -> add one or more attachments (multipart, fields image/voice/video/file)
+  if (req.method === 'POST' && /^\/api\/notes\/(\d+)\/attachments$/.test(url.pathname)) {
+    const id = Number(/^\/api\/notes\/(\d+)\/attachments$/.exec(url.pathname)[1]);
+    const row = stmts.get.get(id);
+    if (!row) return sendJson(res, 404, { error: 'not found' });
+    req_global.content_type = req.headers['content-type'] || '';
+    const body = await readBody(req, MAX_IMAGE_BYTES * 8 + 1024 * 1024);
+    const items = parseMultipartFiles(body)
+      .filter((f) => f.buffer.length > 0)
+      .map((f) => ({ type: ['image', 'voice', 'video', 'file'].includes(f.field) ? f.field : 'file', buffer: f.buffer, ext: f.ext, name: f.name }));
+    if (items.length === 0) return sendJson(res, 400, { error: 'no files' });
+    addAttachments('tracking', id, items);
+    return sendJson(res, 201, { note: rowToPublic(stmts.get.get(id)) });
+  }
+
+  // DELETE /api/notes/:id/attachments/:attId -> remove one attachment
+  const trAttDelMatch = /^\/api\/notes\/(\d+)\/attachments\/(\d+)$/.exec(url.pathname);
+  if (req.method === 'DELETE' && trAttDelMatch) {
+    const id = Number(trAttDelMatch[1]);
+    const attId = Number(trAttDelMatch[2]);
+    if (!stmts.get.get(id)) return sendJson(res, 404, { error: 'not found' });
+    const att = stmts.att_get.get(attId);
+    if (!att || att.note_kind !== 'tracking' || att.note_id !== id) return sendJson(res, 404, { error: 'attachment not found' });
+    stmts.att_remove.run(attId);
+    cleanupOrphanFiles([att.file_name]);
+    return sendJson(res, 200, { ok: true, note: rowToPublic(stmts.get.get(id)) });
+  }
+
   // PATCH /api/notes/:id -> update one tracking note (JSON or multipart with new attachments)
   if (req.method === 'PATCH' && delMatch) {
     const id = Number(delMatch[1]);
@@ -272,25 +399,27 @@ async function handleApi(req, res, url) {
     if (!row) return sendJson(res, 404, { error: 'not found' });
 
     const contentType = req.headers['content-type'] || '';
-    let date, note;
-    // New uploads per slot (null until a file part arrives).
-    const atts = { image: null, voice: null, video: null, file: null };
-    // Explicit slot instructions from fields/JSON: 'keep' | '' (remove) | filename reference.
+    let date, note, expectEndDate;
+    // New multi-attachments from multipart file parts.
+    const newAtts = [];
+    // Attachments to remove during this edit (ids or legacy filenames), applied on save.
+    let removedIds = [];
+    // Explicit slot instructions (legacy image slot): 'keep' | '' (remove) | filename reference.
     const slots = {};
 
     if (/multipart\/form-data/i.test(contentType)) {
       req_global.content_type = contentType;
-      const body = await readBody(req, MAX_IMAGE_BYTES * 4 + 1024 * 1024);
+      const body = await readBody(req, MAX_IMAGE_BYTES * 8 + 1024 * 1024);
       const fields = parseMultipartFields(body, contentType);
       date = (fields.date || '').trim();
       note = (fields.note || '').trim();
-      for (const key of ['image', 'voice', 'video', 'file']) {
-        if (Object.prototype.hasOwnProperty.call(fields, key + '_slot')) slots[key] = fields[key + '_slot'];
-      }
+      expectEndDate = normalizeDateField(fields.expect_end_date);
+      if (Object.prototype.hasOwnProperty.call(fields, 'image_slot')) slots.image = fields.image_slot;
+      removedIds = String(fields.removed_attachment_ids || '').split(',').map((s) => s.trim()).filter(Boolean);
       for (const f of parseMultipartFiles(body)) {
         if (f.buffer.length === 0) continue;
         const key = ['image', 'voice', 'video', 'file'].includes(f.field) ? f.field : 'file';
-        if (!atts[key]) atts[key] = saveImage(f.buffer, f.ext);
+        newAtts.push({ type: key, buffer: f.buffer, ext: f.ext, name: f.name });
       }
     } else {
       const body = await readBody(req, 1024 * 1024);
@@ -302,43 +431,37 @@ async function handleApi(req, res, url) {
       }
       date = (data.date ?? '').trim();
       note = (data.note ?? '').trim();
-      for (const key of ['image', 'voice', 'video', 'file']) {
-        if (Object.prototype.hasOwnProperty.call(data, key + '_slot')) slots[key] = data[key + '_slot'];
-      }
+      expectEndDate = normalizeDateField(data.expect_end_date);
+      if (Object.prototype.hasOwnProperty.call(data, 'image_slot')) slots.image = data.image_slot;
+      if (Array.isArray(data.removed_attachment_ids)) removedIds = data.removed_attachment_ids.map(String);
     }
 
     if (!date) return sendJson(res, 400, { error: 'date is required' });
-    const hasAttach = atts.image || atts.voice || atts.video || atts.file;
-    if (!note && !hasAttach) {
+    if (!note && newAtts.length === 0) {
       return sendJson(res, 400, { error: 'note text or an attachment is required' });
     }
 
-    // Resolve each slot to its final filename.
-    const col = { image: 'image_name', voice: 'voice_name', video: 'video_name', file: 'file_name' };
-    const oldFiles = {};
-    for (const key of ['image', 'voice', 'video', 'file']) {
-      const current = row[col[key]] || null;
-      let next = current; // default: keep
-      if (atts[key]) next = atts[key];                       // new upload replaces
-      else if (Object.prototype.hasOwnProperty.call(slots, key)) {
-        const v = String(slots[key]).trim();
-        if (v === 'keep') next = current;
-        else if (v === '') next = null;                        // explicit remove
-        else next = path.basename(v);                           // reference an existing file
-      }
-      if (next !== current) {
-        oldFiles[col[key]] = current;   // remember files that will be orphaned
-        db.prepare('UPDATE notes SET ' + col[key] + ' = ? WHERE id = ?').run(next, id);
+    // Legacy image slot: resolve to its final filename (keep / remove / reference).
+    let oldImageFile = null;
+    if (Object.prototype.hasOwnProperty.call(slots, 'image')) {
+      const v = String(slots.image).trim();
+      const next = v === 'keep' ? (row.image_name || null) : v === '' ? null : path.basename(v);
+      if (next !== (row.image_name || null)) {
+        oldImageFile = row.image_name || null;
+        db.prepare('UPDATE notes SET image_name = ? WHERE id = ?').run(next, id);
       }
     }
-    db.prepare('UPDATE notes SET date = ?, note = ? WHERE id = ?').run(date, note, id);
 
-    // Delete files that are no longer referenced by ANY row (so shared files survive).
-    for (const [c, fname] of Object.entries(oldFiles)) {
-      if (!fname) continue;
-      const stillUsed = db.prepare('SELECT COUNT(*) AS c FROM notes WHERE ' + c + ' = ?').get(fname).c;
-      if (stillUsed === 0) { try { fs.unlinkSync(path.join(UPLOAD_DIR, fname)); } catch {} }
-    }
+    db.prepare('UPDATE notes SET date = ?, note = ?, expect_end_date = ? WHERE id = ?')
+      .run(date, note, expectEndDate, id);
+
+    // Attachments removed during this edit (applied on save).
+    const removedFiles = removeAttachmentsByIds('tracking', id, removedIds);
+
+    // New multi-attachments.
+    addAttachments('tracking', id, newAtts);
+
+    cleanupOrphanFiles([oldImageFile, ...removedFiles]);
 
     const updated = stmts.get.get(id);
     return sendJson(res, 200, { note: rowToPublic(updated) });
@@ -362,30 +485,35 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, { ok: true, name });
   }
 
-  // GET /api/taking -> list taking notes with their tags
+  // GET /api/taking -> list taking notes with their tags and all attachments
   if (req.method === 'GET' && url.pathname === '/api/taking') {
-    const rows = stmts.t_list.all().map((r) => ({
-      id: r.id,
-      note: r.note,
-      image: r.image_name ? '/uploads/' + r.image_name : null,
-      image_hash: attHash(r.image_name),
-      attachments: attachmentsOf(r),
-      created_at: r.created_at,
-      tags: stmts.tags_for_note.all(r.id).map((t) => t.name),
-    }));
+    const rows = stmts.t_list.all().map((r) => {
+      const atts = attachmentsOfNote('taking', r);
+      return {
+        id: r.id,
+        uuid: r.uuid || null,
+        note: r.note,
+        image: atts.find((a) => a.primary) ? atts.find((a) => a.primary).url : null,
+        image_hash: r.image_name ? attHash(r.image_name) : '',
+        attachments: atts,
+        created_at: r.created_at,
+        tags: stmts.tags_for_note.all(r.id).map((t) => t.name),
+      };
+    });
     return sendJson(res, 200, { notes: rows });
   }
 
-  // POST /api/taking -> create a taking note (JSON or multipart with attachments + tags)
+  // POST /api/taking -> create a taking note (JSON or multipart with attachments + tags; multiple files per type allowed)
   if (req.method === 'POST' && url.pathname === '/api/taking') {
     const contentType = req.headers['content-type'] || '';
     let note;
-    const atts = { image: null, voice: null, video: null, file: null };
+    const legacyRefs = { image: null, voice: null, video: null, file: null };
+    const newAtts = [];
     let tagNames = [];
 
     if (/multipart\/form-data/i.test(contentType)) {
       req_global.content_type = contentType;
-      const body = await readBody(req, MAX_IMAGE_BYTES * 4 + 1024 * 1024);
+      const body = await readBody(req, MAX_IMAGE_BYTES * 8 + 1024 * 1024);
       const fields = parseMultipartFields(body, contentType);
       note = (fields.note || '').trim();
       tagNames = (fields.tags || '')
@@ -395,11 +523,11 @@ async function handleApi(req, res, url) {
       for (const f of parseMultipartFiles(body)) {
         if (f.buffer.length === 0) continue;
         const key = ['image', 'voice', 'video', 'file'].includes(f.field) ? f.field : 'file';
-        if (!atts[key]) atts[key] = saveImage(f.buffer, f.ext);
+        newAtts.push({ type: key, buffer: f.buffer, ext: f.ext, name: f.name });
       }
       for (const key of ['image', 'voice', 'video', 'file']) {
         const ref = (fields[key + '_url'] || '').trim();
-        if (ref && !atts[key]) atts[key] = path.basename(ref);
+        if (ref && !legacyRefs[key]) legacyRefs[key] = path.basename(ref);
       }
     } else {
       const body = await readBody(req, 1024 * 1024);
@@ -415,20 +543,21 @@ async function handleApi(req, res, url) {
         : [];
       for (const key of ['image', 'voice', 'video', 'file']) {
         const ref = (data[key + '_url'] || '').trim();
-        if (ref && !atts[key]) atts[key] = path.basename(ref);
+        if (ref && !legacyRefs[key]) legacyRefs[key] = path.basename(ref);
       }
     }
 
-    const hasAttach = atts.image || atts.voice || atts.video || atts.file;
+    const hasAttach = newAtts.length > 0 || Object.values(legacyRefs).some(Boolean);
     if (!note && !hasAttach) {
       return sendJson(res, 400, { error: 'note text or an attachment is required' });
     }
 
     const info = stmts.t_insert.run(
-      note, atts.image, atts.voice, atts.video, atts.file, new Date().toISOString()
+      note, legacyRefs.image, legacyRefs.voice, legacyRefs.video, legacyRefs.file, newUuid(), new Date().toISOString()
     );
     const id = Number(info.lastInsertRowid);
     attachTags(id, tagNames);
+    addAttachments('taking', id, newAtts);
     return sendJson(res, 201, { note: getTakingNote(id) });
   }
 
@@ -443,6 +572,34 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, { ok: true, id });
   }
 
+  // POST /api/taking/:id/attachments -> add one or more attachments (multipart, fields image/voice/video/file)
+  if (req.method === 'POST' && /^\/api\/taking\/(\d+)\/attachments$/.test(url.pathname)) {
+    const id = Number(/^\/api\/taking\/(\d+)\/attachments$/.exec(url.pathname)[1]);
+    const row = stmts.t_get.get(id);
+    if (!row) return sendJson(res, 404, { error: 'not found' });
+    req_global.content_type = req.headers['content-type'] || '';
+    const body = await readBody(req, MAX_IMAGE_BYTES * 8 + 1024 * 1024);
+    const items = parseMultipartFiles(body)
+      .filter((f) => f.buffer.length > 0)
+      .map((f) => ({ type: ['image', 'voice', 'video', 'file'].includes(f.field) ? f.field : 'file', buffer: f.buffer, ext: f.ext, name: f.name }));
+    if (items.length === 0) return sendJson(res, 400, { error: 'no files' });
+    addAttachments('taking', id, items);
+    return sendJson(res, 201, { note: getTakingNote(id) });
+  }
+
+  // DELETE /api/taking/:id/attachments/:attId -> remove one attachment
+  const tkAttDelMatch = /^\/api\/taking\/(\d+)\/attachments\/(\d+)$/.exec(url.pathname);
+  if (req.method === 'DELETE' && tkAttDelMatch) {
+    const id = Number(tkAttDelMatch[1]);
+    const attId = Number(tkAttDelMatch[2]);
+    if (!stmts.t_get.get(id)) return sendJson(res, 404, { error: 'not found' });
+    const att = stmts.att_get.get(attId);
+    if (!att || att.note_kind !== 'taking' || att.note_id !== id) return sendJson(res, 404, { error: 'attachment not found' });
+    stmts.att_remove.run(attId);
+    cleanupOrphanFiles([att.file_name]);
+    return sendJson(res, 200, { ok: true, note: getTakingNote(id) });
+  }
+
   // PATCH /api/taking/:id -> update one taking note (JSON or multipart with new attachments + tags)
   if (req.method === 'PATCH' && tDelMatch) {
     const id = Number(tDelMatch[1]);
@@ -452,24 +609,24 @@ async function handleApi(req, res, url) {
     const contentType = req.headers['content-type'] || '';
     let note;
     let tagNames = null; // null = keep current tags
-    const atts = { image: null, voice: null, video: null, file: null };
+    const newAtts = [];
+    let removedIds = [];
     const slots = {};
 
     if (/multipart\/form-data/i.test(contentType)) {
       req_global.content_type = contentType;
-      const body = await readBody(req, MAX_IMAGE_BYTES * 4 + 1024 * 1024);
+      const body = await readBody(req, MAX_IMAGE_BYTES * 8 + 1024 * 1024);
       const fields = parseMultipartFields(body, contentType);
       note = (fields.note || '').trim();
       if (Object.prototype.hasOwnProperty.call(fields, 'tags')) {
         tagNames = (fields.tags || '').split(',').map((s) => s.trim()).filter(Boolean);
       }
-      for (const key of ['image', 'voice', 'video', 'file']) {
-        if (Object.prototype.hasOwnProperty.call(fields, key + '_slot')) slots[key] = fields[key + '_slot'];
-      }
+      if (Object.prototype.hasOwnProperty.call(fields, 'image_slot')) slots.image = fields.image_slot;
+      removedIds = String(fields.removed_attachment_ids || '').split(',').map((s) => s.trim()).filter(Boolean);
       for (const f of parseMultipartFiles(body)) {
         if (f.buffer.length === 0) continue;
         const key = ['image', 'voice', 'video', 'file'].includes(f.field) ? f.field : 'file';
-        if (!atts[key]) atts[key] = saveImage(f.buffer, f.ext);
+        newAtts.push({ type: key, buffer: f.buffer, ext: f.ext, name: f.name });
       }
     } else {
       const body = await readBody(req, 1024 * 1024);
@@ -483,42 +640,35 @@ async function handleApi(req, res, url) {
       if (Object.prototype.hasOwnProperty.call(data, 'tags')) {
         tagNames = Array.isArray(data.tags) ? data.tags.map((s) => String(s).trim()).filter(Boolean) : null;
       }
-      for (const key of ['image', 'voice', 'video', 'file']) {
-        if (Object.prototype.hasOwnProperty.call(data, key + '_slot')) slots[key] = data[key + '_slot'];
-      }
+      if (Object.prototype.hasOwnProperty.call(data, 'image_slot')) slots.image = data.image_slot;
+      if (Array.isArray(data.removed_attachment_ids)) removedIds = data.removed_attachment_ids.map(String);
     }
 
-    const hasAttach = atts.image || atts.voice || atts.video || atts.file;
-    if (!note && !hasAttach) {
+    if (!note && newAtts.length === 0) {
       return sendJson(res, 400, { error: 'note text or an attachment is required' });
     }
 
-    const col = { image: 'image_name', voice: 'voice_name', video: 'video_name', file: 'file_name' };
-    const oldFiles = {};
-    for (const key of ['image', 'voice', 'video', 'file']) {
-      const current = row[col[key]] || null;
-      let next = current; // default: keep
-      if (atts[key]) next = atts[key];
-      else if (Object.prototype.hasOwnProperty.call(slots, key)) {
-        const v = String(slots[key]).trim();
-        if (v === 'keep') next = current;
-        else if (v === '') next = null;
-        else next = path.basename(v);
-      }
-      if (next !== current) {
-        oldFiles[col[key]] = current;
-        db.prepare('UPDATE taking_notes SET ' + col[key] + ' = ? WHERE id = ?').run(next, id);
+    // Legacy image slot: resolve to its final filename (keep / remove / reference).
+    let oldImageFile = null;
+    if (Object.prototype.hasOwnProperty.call(slots, 'image')) {
+      const v = String(slots.image).trim();
+      const next = v === 'keep' ? (row.image_name || null) : v === '' ? null : path.basename(v);
+      if (next !== (row.image_name || null)) {
+        oldImageFile = row.image_name || null;
+        db.prepare('UPDATE taking_notes SET image_name = ? WHERE id = ?').run(next, id);
       }
     }
+
     db.prepare('UPDATE taking_notes SET note = ? WHERE id = ?').run(note, id);
 
     if (tagNames !== null) attachTags(id, tagNames);
 
-    for (const [c, fname] of Object.entries(oldFiles)) {
-      if (!fname) continue;
-      const stillUsed = db.prepare('SELECT COUNT(*) AS c FROM taking_notes WHERE ' + c + ' = ?').get(fname).c;
-      if (stillUsed === 0) { try { fs.unlinkSync(path.join(UPLOAD_DIR, fname)); } catch {} }
-    }
+    // Attachments removed during this edit (applied on save).
+    const removedFiles = removeAttachmentsByIds('taking', id, removedIds);
+
+    addAttachments('taking', id, newAtts);
+
+    cleanupOrphanFiles([oldImageFile, ...removedFiles]);
 
     return sendJson(res, 200, { note: getTakingNote(id) });
   }
@@ -585,18 +735,29 @@ async function handleApi(req, res, url) {
 
   // GET /api/sync/pull -> return the hub's consolidated records (+ tags)
   if (req.method === 'GET' && url.pathname === '/api/sync/pull') {
+    // All attachments of a note as portable { type, name, hash } objects. The startup
+    // migration moves legacy single-slot columns into the attachments table, so the table
+    // is the complete source of truth — read only from it (re-adding the legacy slot would
+    // create phantom duplicates when the migrated filename differs).
+    const syncAtts = (kind, row) =>
+      stmts.att_list.all(kind, row.id).map((a) => ({ type: a.type, name: a.file_name, hash: attHash(a.file_name) }));
     const tracking = stmts.list.all().map((r) => ({
+      uuid: r.uuid || null,
       date: r.date, note: r.note, created_at: r.created_at,
       image: r.image_name, voice: r.voice_name, video: r.video_name, file: r.file_name,
+      expect_end_date: r.expect_end_date || null, archived: !!r.archived,
       image_hash: attHash(r.image_name), voice_hash: attHash(r.voice_name),
       video_hash: attHash(r.video_name), file_hash: attHash(r.file_name),
+      attachments: syncAtts('tracking', r),
     }));
     const taking = stmts.t_list.all().map((r) => ({
+      uuid: r.uuid || null,
       note: r.note, created_at: r.created_at,
       image: r.image_name, voice: r.voice_name, video: r.video_name, file: r.file_name,
       image_hash: attHash(r.image_name), voice_hash: attHash(r.voice_name),
       video_hash: attHash(r.video_name), file_hash: attHash(r.file_name),
       tags: stmts.tags_for_note.all(r.id).map((t) => t.name),
+      attachments: syncAtts('taking', r),
     }));
     const tags = stmts.tag_all.all().map((t) => t.name);
     return sendJson(res, 200, { tracking, taking, tags });
@@ -631,56 +792,112 @@ function attHash(filename) {
 }
 
 // Canonical identity for a note: text fields + attachment CONTENT hashes (not filenames).
-function trackingIdentity({ date, note, image_name, voice_name, video_name, file_name }) {
-  return [date || '', note || '', attHash(image_name), attHash(voice_name), attHash(video_name), attHash(file_name)].join('\u0001');
+// expect_end_date is included so the same record with different end dates stays distinct;
+// archived state is intentionally excluded (it is per-device UI state, not content).
+function trackingIdentity({ date, note, image_name, voice_name, video_name, file_name, expect_end_date, note_id }) {
+  const extra = stmts.att_list.all('tracking', note_id).map((a) => a.type + ':' + attHash(a.file_name)).sort().join('\u0001');
+  return [date || '', note || '', attHash(image_name), attHash(voice_name), attHash(video_name), attHash(file_name), expect_end_date || '', extra].join('\u0001');
 }
-function takingIdentity({ note, image_name, voice_name, video_name, file_name, tags }) {
-  return [note || '', attHash(image_name), attHash(voice_name), attHash(video_name), attHash(file_name), (tags || []).slice().sort().join(',')].join('\u0001');
+function takingIdentity({ note, image_name, voice_name, video_name, file_name, tags, note_id }) {
+  const extra = stmts.att_list.all('taking', note_id).map((a) => a.type + ':' + attHash(a.file_name)).sort().join('\u0001');
+  return [note || '', attHash(image_name), attHash(voice_name), attHash(video_name), attHash(file_name), (tags || []).slice().sort().join(','), extra].join('\u0001');
 }
 
 // An incoming sync object carries attachment content hashes under *_hash keys (sent by the
 // client). Fall back to reading the local file if a hash isn't provided.
 function trackingIdentityIn(n) {
-  return [n.date || '', n.note || '', n.image_hash || attHash(n.image), n.voice_hash || attHash(n.voice), n.video_hash || attHash(n.video), n.file_hash || attHash(n.file)].join('\u0001');
+  const extra = incomingAttList(n).map((a) => a.type + ':' + (a.hash || attHash(a.name))).sort().join('\u0001');
+  return [n.date || '', n.note || '', n.image_hash || attHash(n.image), n.voice_hash || attHash(n.voice), n.video_hash || attHash(n.video), n.file_hash || attHash(n.file), n.expect_end_date || '', extra].join('\u0001');
 }
 function takingIdentityIn(n) {
-  return [n.note || '', n.image_hash || attHash(n.image), n.voice_hash || attHash(n.voice), n.video_hash || attHash(n.video), n.file_hash || attHash(n.file), (n.tags || []).slice().sort().join(',')].join('\u0001');
+  const extra = incomingAttList(n).map((a) => a.type + ':' + (a.hash || attHash(a.name))).sort().join('\u0001');
+  return [n.note || '', n.image_hash || attHash(n.image), n.voice_hash || attHash(n.voice), n.video_hash || attHash(n.video), n.file_hash || attHash(n.file), (n.tags || []).slice().sort().join(','), extra].join('\u0001');
 }
 
-// Insert incoming tracking notes that aren't already present (by content identity).
+// Build the identity of an incoming note from its attachment list (legacy slots + extra attachments).
+function incomingAttList(n) {
+  const out = [];
+  if (n.image) out.push({ type: 'image', hash: n.image_hash || '' });
+  if (n.voice) out.push({ type: 'audio', hash: n.voice_hash || '' });
+  if (n.video) out.push({ type: 'video', hash: n.video_hash || '' });
+  if (n.file) out.push({ type: 'file', hash: n.file_hash || '' });
+  for (const a of n.attachments || []) {
+    if (a && a.name) out.push({ type: a.type || 'file', hash: a.hash || '' });
+  }
+  return out;
+}
+
+// Insert incoming tracking notes that aren't already present.
+// Dedupe order: (1) stable uuid — the same note on any device, even if content changed;
+// (2) content identity hash — for notes created before uuids existed.
 function addedTracking(incoming) {
-  const existing = new Set(stmts.list.all().map((r) => sha1(trackingIdentity(r))));
+  const rows = stmts.list.all();
+  const byUuid = new Set(rows.filter((r) => r.uuid).map((r) => r.uuid));
+  const byHash = new Set(rows.map((r) => sha1(trackingIdentity({ ...r, note_id: r.id }))));
   let added = 0;
   for (const n of incoming || []) {
     if (!n) continue;
+    const uuid = String(n.uuid || '').trim();
+    if (uuid && byUuid.has(uuid)) continue; // same note already here (by identity)
     const h = sha1(trackingIdentityIn(n));
-    if (existing.has(h)) continue;
-    stmts.insert.run(
+    if (byHash.has(h)) {
+      // Same content already here (legacy note without uuid): adopt the incoming uuid on the
+      // matching row so future syncs dedupe by identity instead of re-matching by content.
+      if (uuid) {
+        const match = rows.find((r) => !r.uuid && sha1(trackingIdentity({ ...r, note_id: r.id })) === h);
+        if (match) db.prepare('UPDATE notes SET uuid = ? WHERE id = ?').run(uuid, match.id);
+      }
+      continue;
+    }
+    const info = stmts.insert.run(
       n.date, n.note || '', n.image || null, n.voice || null, n.video || null, n.file || null,
+      normalizeDateField(n.expect_end_date), uuid || newUuid(),
       n.created_at || new Date().toISOString()
     );
-    existing.add(h);
+    // Extra (non-legacy-slot) attachments arrive as { type, name, hash } from the peer.
+    const legacyNames = new Set([n.image, n.voice, n.video, n.file].filter(Boolean));
+    addAttachments('tracking', Number(info.lastInsertRowid), (n.attachments || [])
+      .filter((a) => a && a.name && !legacyNames.has(a.name))
+      .map((a) => ({ type: a.type || 'file', name: a.name, hash: a.hash })));
+    if (uuid) byUuid.add(uuid);
+    byHash.add(h);
     added++;
   }
   return added;
 }
 
-// Insert incoming taking notes that aren't already present (by content identity).
+// Insert incoming taking notes that aren't already present (same uuid-first dedupe).
 function addedTaking(incoming) {
-  const existing = new Set(
-    stmts.t_list.all().map((r) => sha1(takingIdentity({ ...r, tags: stmts.tags_for_note.all(r.id).map((t) => t.name) })))
+  const rows = stmts.t_list.all();
+  const byUuid = new Set(rows.filter((r) => r.uuid).map((r) => r.uuid));
+  const byHash = new Set(
+    rows.map((r) => sha1(takingIdentity({ ...r, note_id: r.id, tags: stmts.tags_for_note.all(r.id).map((t) => t.name) })))
   );
   let added = 0;
   for (const n of incoming || []) {
     if (!n) continue;
+    const uuid = String(n.uuid || '').trim();
+    if (uuid && byUuid.has(uuid)) continue; // same note already here (by identity)
     const h = sha1(takingIdentityIn(n));
-    if (existing.has(h)) continue;
+    if (byHash.has(h)) {
+      if (uuid) {
+        const match = rows.find((r) => !r.uuid && sha1(takingIdentity({ ...r, note_id: r.id, tags: stmts.tags_for_note.all(r.id).map((t) => t.name) })) === h);
+        if (match) db.prepare('UPDATE taking_notes SET uuid = ? WHERE id = ?').run(uuid, match.id);
+      }
+      continue;
+    }
     const info = stmts.t_insert.run(
       n.note || '', n.image || null, n.voice || null, n.video || null, n.file || null,
+      uuid || newUuid(),
       n.created_at || new Date().toISOString()
     );
     attachTags(Number(info.lastInsertRowid), (n.tags || []).map(String));
-    existing.add(h);
+    const legacyNames = new Set([n.image, n.voice, n.video, n.file].filter(Boolean));
+    addAttachments('taking', Number(info.lastInsertRowid), (n.attachments || [])
+      .filter((a) => a && a.name && !legacyNames.has(a.name))
+      .map((a) => ({ type: a.type || 'file', name: a.name, hash: a.hash })));
+    if (uuid) byUuid.add(uuid);
+    byHash.add(h);
     added++;
   }
   return added;
@@ -697,12 +914,14 @@ function attachTags(noteId, tagNames) {
 
 function getTakingNote(id) {
   const r = stmts.t_get.get(id);
+  const atts = attachmentsOfNote('taking', r);
   return {
     id: r.id,
+    uuid: r.uuid || null,
     note: r.note,
-    image: r.image_name ? '/uploads/' + r.image_name : null,
-    image_hash: attHash(r.image_name),
-    attachments: attachmentsOf(r),
+    image: atts.find((a) => a.primary) ? atts.find((a) => a.primary).url : null,
+    image_hash: r.image_name ? attHash(r.image_name) : '',
+    attachments: atts,
     created_at: r.created_at,
     tags: stmts.tags_for_note.all(id).map((t) => t.name),
   };
@@ -735,31 +954,102 @@ function parseMultipartFields(body, contentType) {
   return out;
 }
 
-function attachmentsOf(row) {
-  const out = [];
-  if (row.voice_name) out.push({ type: 'audio', url: '/uploads/' + row.voice_name, hash: attHash(row.voice_name) });
-  if (row.video_name) out.push({ type: 'video', url: '/uploads/' + row.video_name, hash: attHash(row.video_name) });
-  if (row.file_name) out.push({ type: 'file', url: '/uploads/' + row.file_name, name: row.file_name, hash: attHash(row.file_name) });
+// Remove all stored attachment files for a deleted row (legacy slots + attachments table).
+function deleteRowFiles(row) {
+  const names = new Set();
+  for (const col of ['image_name', 'voice_name', 'video_name', 'file_name']) {
+    if (row[col]) names.add(row[col]);
+  }
+  const kind = row.note_kind || 'tracking';
+  for (const a of stmts.att_list.all(kind, row.id)) names.add(a.file_name);
+  for (const name of names) {
+    try { fs.unlinkSync(path.join(UPLOAD_DIR, name)); } catch {}
+  }
+}
+
+// Public attachment object. `primary` marks the legacy single-slot image (used as the card thumbnail).
+function attToPublic(a, primary) {
+  const type = a.type || 'file';
+  const out = {
+    id: a.id,
+    type,
+    url: '/uploads/' + a.file_name,
+    name: a.original_name || a.file_name,
+    hash: attHash(a.file_name),
+  };
+  if (primary) out.primary = true;
   return out;
 }
 
-// Remove all stored attachment files for a deleted row.
-function deleteRowFiles(row) {
-  for (const col of ['image_name', 'voice_name', 'video_name', 'file_name']) {
-    if (row[col]) {
-      try { fs.unlinkSync(path.join(UPLOAD_DIR, row[col])); } catch {}
+// All attachments of a note as public objects. The legacy image slot is included first
+// (marked primary) unless it was already migrated into the attachments table.
+function attachmentsOfNote(kind, row) {
+  const atts = stmts.att_list.all(kind, row.id).map((a) => attToPublic(a, false));
+  if (row.image_name && !atts.some((a) => a.url === '/uploads/' + row.image_name)) {
+    atts.unshift(attToPublic({ id: null, type: 'image', file_name: row.image_name, original_name: row.image_name }, true));
+  }
+  return atts;
+}
+
+// Add attachments to a note. Two shapes of item are supported:
+//   { type, buffer, ext, name }  — bytes to store (regular uploads)
+//   { type, name, hash }         — reference an already-stored filename (sync apply)
+function addAttachments(kind, noteId, items) {
+  const base = stmts.att_list.all(kind, noteId).length;
+  let i = 0;
+  for (const it of items || []) {
+    if (!it) continue;
+    let fname;
+    if (it.buffer && it.buffer.length > 0) {
+      fname = saveImage(it.buffer, it.ext);
+    } else if (it.name) {
+      fname = path.basename(it.name);
+    } else {
+      continue;
     }
+    stmts.att_insert.run(kind, noteId, it.type || 'file', fname, it.original_name || null, base + i++, new Date().toISOString());
+  }
+}
+
+// Remove attachments by id from a note (used by PATCH removed_attachment_ids during edit).
+// Legacy-slot attachments (id null) are matched by filename instead. Returns orphaned filenames.
+function removeAttachmentsByIds(kind, noteId, idsOrNames) {
+  const wanted = new Set((idsOrNames || []).map(String));
+  if (wanted.size === 0) return [];
+  const orphans = [];
+  for (const a of stmts.att_list.all(kind, noteId)) {
+    if (wanted.has(String(a.id)) || wanted.has(a.file_name)) {
+      stmts.att_remove.run(a.id);
+      orphans.push(a.file_name);
+    }
+  }
+  return orphans;
+}
+
+// Delete attachment files that are no longer referenced anywhere (legacy slots or the table).
+function cleanupOrphanFiles(names) {
+  for (const name of names) {
+    if (!name) continue;
+    const inTable = db.prepare('SELECT COUNT(*) AS c FROM attachments WHERE file_name = ?').get(name).c;
+    let inLegacy = 0;
+    try { inLegacy += db.prepare('SELECT COUNT(*) AS c FROM notes WHERE image_name = ? OR voice_name = ? OR video_name = ? OR file_name = ?').get(name, name, name, name).c; } catch {}
+    try { inLegacy += db.prepare('SELECT COUNT(*) AS c FROM taking_notes WHERE image_name = ? OR voice_name = ? OR video_name = ? OR file_name = ?').get(name, name, name, name).c; } catch {}
+    if (inTable === 0 && inLegacy === 0) { try { fs.unlinkSync(path.join(UPLOAD_DIR, name)); } catch {} }
   }
 }
 
 function rowToPublic(row) {
+  const atts = attachmentsOfNote('tracking', row);
   return {
     id: row.id,
+    uuid: row.uuid || null,
     date: row.date,
     note: row.note,
-    image: row.image_name ? '/uploads/' + row.image_name : null,
-    image_hash: attHash(row.image_name),
-    attachments: attachmentsOf(row),
+    image: atts.find((a) => a.primary) ? atts.find((a) => a.primary).url : null,
+    image_hash: row.image_name ? attHash(row.image_name) : '',
+    attachments: atts,
+    expect_end_date: row.expect_end_date || null,
+    archived: !!row.archived,
     created_at: row.created_at,
   };
 }

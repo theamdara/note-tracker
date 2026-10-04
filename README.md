@@ -21,6 +21,8 @@ node server.js            # default port 3001
 # or
 node server.js 3000       # custom port
 PORT=8080 node server.js  # via env var
+
+node -r ./patch-os.js server.js  # on userland android
 ```
 
 Open the printed URL (e.g. `http://127.0.0.1:3001`). Data is stored in `notes.db` (SQLite, WAL mode) next to `server.js`; attachments are saved to `uploads/`.

@@ -56,21 +56,40 @@
   }
   input:focus, textarea:focus { outline: 2px solid rgba(37,99,235,.35); border-color: var(--accent); }
   textarea { resize: vertical; min-height: 64px; }
-  .img-preview {
-    max-width: 120px; max-height: 120px; border-radius: 8px; border: 1px solid var(--line);
-    display: none; margin-top: 4px; object-fit: cover;
+  /* Multiple image previews in the form (thumbnails with remove) */
+  .img-grid { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+  .img-thumb { position: relative; width: 72px; height: 72px; border-radius: 8px; overflow: hidden; border: 1px solid var(--line); }
+  .img-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .img-thumb .rm {
+    position: absolute; top: 2px; right: 2px; width: 20px; height: 20px; border-radius: 999px;
+    background: rgba(0,0,0,.55); color: #fff; border: none; cursor: pointer; font-size: .8rem; line-height: 1;
+    display: flex; align-items: center; justify-content: center; padding: 0;
   }
-  /* Attachment previews in the form (audio/video/file) */
-  .attach-prev { display: none; flex-direction: column; gap: 6px; margin-top: 8px; max-width: 260px; }
+  .img-thumb .rm:hover { background: var(--danger); }
+  .img-thumb.removed img { opacity: .45; filter: grayscale(.6); }
+
+  /* Attachment previews in the form (audio/video/file), one row per file */
+  .attach-prev { display: none; flex-direction: column; gap: 6px; margin-top: 8px; max-width: 320px; }
   .attach-prev audio, .attach-prev video { width: 100%; border-radius: 8px; }
   .attach-prev .fname { font-size: .78rem; color: var(--muted); word-break: break-all; display: flex; justify-content: space-between; gap: 8px; align-items: center; }
   .attach-prev .rm { background: transparent; border: none; color: var(--danger); cursor: pointer; font-size: .75rem; white-space: nowrap; }
 
   /* Attachment rendering inside a note card */
-  .note .attach { margin-top: 8px; display: grid; gap: 6px; }
+  .note .attach { margin-top: 8px; display: grid; gap: 8px; }
+  .att-imgs { display: flex; flex-wrap: wrap; gap: 6px; }
+  .att-img-box { position: relative; width: 72px; height: 72px; }
+  .att-img-box img { width: 72px; height: 72px; object-fit: cover; border-radius: 8px; border: 1px solid var(--line); cursor: zoom-in; display: block; }
+  .att-img-box .att-rm { position: absolute; top: -6px; right: -6px; width: 20px; height: 20px; border-radius: 999px; background: var(--danger); color: #fff; font-size: .7rem; line-height: 1; display: flex; align-items: center; justify-content: center; padding: 0; box-shadow: 0 1px 2px rgba(0,0,0,.3); }
+  .att-img-box .att-rm:hover { filter: brightness(1.1); }
   .note .attach audio, .note .attach video { width: 100%; max-width: 320px; border-radius: 8px; }
   .note .attach a.file-link { display: inline-flex; align-items: center; gap: 6px; font-size: .85rem; color: var(--accent); text-decoration: none; word-break: break-all; }
   .note .attach a.file-link:hover { text-decoration: underline; }
+  .att-rm { background: transparent; border: none; color: var(--danger); cursor: pointer; font-size: .75rem; padding: 0 4px; white-space: nowrap; }
+  .att-rm:hover { text-decoration: underline; }
+
+  /* Lightbox for clicking a note image */
+  .lightbox { position: fixed; inset: 0; background: rgba(0,0,0,.8); display: flex; align-items: center; justify-content: center; z-index: 50; cursor: zoom-out; }
+  .lightbox img { max-width: 92vw; max-height: 92vh; border-radius: 8px; }
   .actions { display: flex; align-items: center; gap: 12px; }
   button.primary {
     font: inherit; font-weight: 600; background: var(--accent); color: var(--accent-ink);
@@ -140,6 +159,8 @@
   .note .body { flex: 1 1 auto; min-width: 0; }
   .note .meta { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
   .badge { background: #eef2ff; color: #3730a3; font-weight: 600; font-size: .78rem; padding: 2px 8px; border-radius: 999px; }
+  .end-badge { background: #fef3c7; color: #92400e; font-weight: 600; font-size: .78rem; padding: 2px 8px; border-radius: 999px; }
+  .end-badge.soon { background: #fee2e2; color: #991b1b; }
   .created { color: var(--muted); font-size: .75rem; }
   .tag-pill { background: #f1f5f9; color: #475569; font-size: .72rem; padding: 2px 8px; border-radius: 999px; }
   .note .text { white-space: pre-wrap; word-break: break-word; margin: 0; }
@@ -149,6 +170,8 @@
   .edit:hover { background: #eff6ff; }
   .del { color: var(--danger); }
   .del:hover { background: #fef2f2; }
+  .arch { color: #92400e; }
+  .arch:hover { background: #fffbeb; }
   .cancel-edit { color: var(--muted); display: none; }
   .cancel-edit:hover { background: #f3f4f6; }
   form.card.editing { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(37,99,235,.15); }
@@ -164,6 +187,8 @@
 
   <nav class="tabs">
     <button class="tab active" data-tab="tracking" type="button">Note Tracking</button>
+    <button class="tab" data-tab="endsoon" type="button">Ending Soon</button>
+    <button class="tab" data-tab="archive" type="button">Archive</button>
     <button class="tab" data-tab="taking" type="button">Note Taking</button>
     <button class="tab" data-tab="sync" type="button">Sync</button>
   </nav>
@@ -205,27 +230,31 @@
           <label for="tr-date">Date</label>
           <input type="date" id="tr-date" name="date" required />
         </div>
+        <div class="field">
+          <label for="tr-expect-end">Expected end date (optional)</label>
+          <input type="date" id="tr-expect-end" name="expect_end_date" />
+        </div>
         <div class="field grow">
-          <label for="tr-image">Image (optional)</label>
-          <input type="file" id="tr-image" name="image" accept="image/*" />
-          <img id="tr-preview" class="img-preview" alt="preview" />
+          <label for="tr-image">Images (optional, multiple allowed)</label>
+          <input type="file" id="tr-image" name="image" accept="image/*" multiple />
+          <div class="img-grid" id="tr-img-prev"></div>
         </div>
       </div>
       <div class="row">
         <div class="field grow">
-          <label for="tr-voice">Voice (optional)</label>
-          <input type="file" id="tr-voice" accept="audio/*" />
+          <label for="tr-voice">Voice (optional, multiple allowed)</label>
+          <input type="file" id="tr-voice" accept="audio/*" multiple />
           <div class="attach-prev" id="tr-voice-prev"></div>
         </div>
         <div class="field grow">
-          <label for="tr-video">Video (optional)</label>
-          <input type="file" id="tr-video" accept="video/*" />
+          <label for="tr-video">Video (optional, multiple allowed)</label>
+          <input type="file" id="tr-video" accept="video/*" multiple />
           <div class="attach-prev" id="tr-video-prev"></div>
         </div>
       </div>
       <div class="field grow">
-        <label for="tr-file">File (optional)</label>
-        <input type="file" id="tr-file" />
+        <label for="tr-file">Files (optional, multiple allowed)</label>
+        <input type="file" id="tr-file" multiple />
         <div class="attach-prev" id="tr-file-prev"></div>
       </div>
       <div class="field">
@@ -248,29 +277,43 @@
     <p id="tr-empty" class="empty" hidden>No records yet. Add your first one above.</p>
   </section>
 
+  <!-- ============ ENDING SOON PANEL (tracking notes expected to end within 1 week) ============ -->
+  <section id="panel-endsoon" class="panel">
+    <div class="list-head"><h2>Ending within the next 7 days</h2><span class="count" id="es-count"></span></div>
+    <ul id="es-notes" class="notes"></ul>
+    <p id="es-empty" class="empty">Nothing is expected to end in the next week.</p>
+  </section>
+
+  <!-- ============ ARCHIVE PANEL (archived tracking notes) ============ -->
+  <section id="panel-archive" class="panel">
+    <div class="list-head"><h2>Archived records</h2><span class="count" id="ar-count"></span></div>
+    <ul id="ar-notes" class="notes"></ul>
+    <p id="ar-empty" class="empty">No archived records. Use the Archive button on a record to move it here.</p>
+  </section>
+
   <!-- ============ TAKING PANEL ============ -->
   <section id="panel-taking" class="panel">
     <form id="taking-form" class="card" autocomplete="off">
       <div class="field grow">
-        <label for="tk-image">Image (optional)</label>
-        <input type="file" id="tk-image" name="image" accept="image/*" />
-        <img id="tk-preview" class="img-preview" alt="preview" />
+        <label for="tk-image">Images (optional, multiple allowed)</label>
+        <input type="file" id="tk-image" name="image" accept="image/*" multiple />
+        <div class="img-grid" id="tk-img-prev"></div>
       </div>
       <div class="row">
         <div class="field grow">
-          <label for="tk-voice">Voice (optional)</label>
-          <input type="file" id="tk-voice" accept="audio/*" />
+          <label for="tk-voice">Voice (optional, multiple allowed)</label>
+          <input type="file" id="tk-voice" accept="audio/*" multiple />
           <div class="attach-prev" id="tk-voice-prev"></div>
         </div>
         <div class="field grow">
-          <label for="tk-video">Video (optional)</label>
-          <input type="file" id="tk-video" accept="video/*" />
+          <label for="tk-video">Video (optional, multiple allowed)</label>
+          <input type="file" id="tk-video" accept="video/*" multiple />
           <div class="attach-prev" id="tk-video-prev"></div>
         </div>
       </div>
       <div class="field grow">
-        <label for="tk-file">File (optional)</label>
-        <input type="file" id="tk-file" />
+        <label for="tk-file">Files (optional, multiple allowed)</label>
+        <input type="file" id="tk-file" multiple />
         <div class="attach-prev" id="tk-file-prev"></div>
       </div>
       <div class="field">
@@ -321,21 +364,43 @@
     el.className = 'status' + (cls ? ' ' + cls : '');
     if (msg) setTimeout(() => { if (el.textContent === msg) setStatus(el, ''); }, 4000);
   }
-  function bindImagePreview(inputEl, previewEl) {
-    inputEl.addEventListener('change', () => {
-      const f = inputEl.files && inputEl.files[0];
-      if (f) { previewEl.src = URL.createObjectURL(f); previewEl.style.display = 'block'; }
-      else { previewEl.style.display = 'none'; previewEl.removeAttribute('src'); }
+  // Multi-image preview in the form: one thumbnail per chosen file, each removable.
+  function bindImagePreview(inputEl, gridEl) {
+    inputEl.addEventListener('change', () => renderImgGrid(gridEl, inputEl));
+  }
+  function renderImgGrid(gridEl, inputEl) {
+    gridEl.innerHTML = '';
+    const files = Array.from(inputEl.files || []);
+    files.forEach((f, idx) => {
+      const box = document.createElement('div'); box.className = 'img-thumb';
+      const img = document.createElement('img'); img.src = URL.createObjectURL(f); img.alt = f.name;
+      const rm = document.createElement('button'); rm.type = 'button'; rm.className = 'rm'; rm.title = 'Remove this image'; rm.innerHTML = '&times;';
+      rm.addEventListener('click', () => { removeFileAt(inputEl, idx); });
+      box.append(img, rm);
+      gridEl.appendChild(box);
     });
   }
 
-  // Generic attachment preview for audio / video / file inputs.
+  // Remove one file from a multi-select input (FileList is read-only: rebuild it).
+  function removeFileAt(inputEl, idx) {
+    const dt = new DataTransfer();
+    for (const f of Array.from(inputEl.files || [])) {
+      if (Array.from(inputEl.files).indexOf(f) === idx) continue;
+      dt.items.add(f);
+    }
+    inputEl.files = dt.files;
+  }
+
+  // Generic attachment preview for audio / video / file inputs (multiple files allowed).
   // kind: 'audio' | 'video' | 'file'
   function bindAttachPreview(inputEl, boxEl, kind) {
-    inputEl.addEventListener('change', () => {
-      const f = inputEl.files && inputEl.files[0];
-      boxEl.innerHTML = '';
-      if (!f) return;
+    inputEl.addEventListener('change', () => renderAttachPrev(boxEl, inputEl, kind));
+  }
+  function renderAttachPrev(boxEl, inputEl, kind) {
+    boxEl.innerHTML = '';
+    const files = Array.from(inputEl.files || []);
+    if (files.length === 0) { boxEl.style.display = 'none'; return; }
+    files.forEach((f, idx) => {
       const url = URL.createObjectURL(f);
       let media;
       if (kind === 'audio') { media = document.createElement('audio'); media.controls = true; media.src = url; }
@@ -344,56 +409,169 @@
       const fname = document.createElement('div'); fname.className = 'fname';
       const span = document.createElement('span'); span.textContent = f.name;
       const rm = document.createElement('button'); rm.type = 'button'; rm.className = 'rm'; rm.textContent = '✕ remove';
-      rm.addEventListener('click', () => { inputEl.value = ''; boxEl.innerHTML = ''; });
+      rm.addEventListener('click', () => { removeFileAt(inputEl, idx); });
       fname.append(span, rm);
       if (media) boxEl.appendChild(media);
       boxEl.appendChild(fname);
-      boxEl.style.display = 'flex';
     });
+    boxEl.style.display = 'flex';
   }
 
-  // Render saved attachments inside a note card. n.attachments = [{type,url,name}]
-  function renderAttachments(container, attachments) {
+  // Lightbox: click an image to view it full-size; click anywhere to close.
+  function openLightbox(src) {
+    const lb = document.createElement('div'); lb.className = 'lightbox';
+    const img = document.createElement('img'); img.src = src;
+    lb.appendChild(img);
+    lb.addEventListener('click', () => lb.remove());
+    document.body.appendChild(lb);
+  }
+
+  // Render saved attachments inside a note card. n.attachments = [{id?,type,url,name}]
+  // opts: { onRemove?(att) } — shows a remove (✕) button per attachment when given.
+  function renderAttachments(container, attachments, opts) {
     if (!attachments || !attachments.length) return;
     const wrap = document.createElement('div'); wrap.className = 'attach';
+    const imgs = attachments.filter((a) => a.type === 'image');
+    if (imgs.length > 0) {
+      const grid = document.createElement('div'); grid.className = 'att-imgs';
+      for (const a of imgs) {
+        const box = document.createElement('div'); box.className = 'att-img-box';
+        const img = document.createElement('img'); img.src = a.url; img.alt = a.name || 'image';
+        img.addEventListener('click', () => openLightbox(a.url));
+        box.appendChild(img);
+        if (opts && opts.onRemove) { const b = attRemoveBtn(a, opts.onRemove); if (b) box.appendChild(b); }
+        grid.appendChild(box);
+      }
+      wrap.appendChild(grid);
+    }
     for (const a of attachments) {
       if (a.type === 'audio') {
-        const el = document.createElement('audio'); el.controls = true; el.src = a.url; wrap.appendChild(el);
+        const row = document.createElement('div'); row.style.display = 'flex'; row.style.gap = '8px'; row.style.alignItems = 'center';
+        const el = document.createElement('audio'); el.controls = true; el.src = a.url; el.style.flex = '1 1 auto';
+        row.appendChild(el);
+        if (opts && opts.onRemove) { const b = attRemoveBtn(a, opts.onRemove); if (b) row.appendChild(b); }
+        wrap.appendChild(row);
       } else if (a.type === 'video') {
         const el = document.createElement('video'); el.controls = true; el.src = a.url; wrap.appendChild(el);
+        if (opts && opts.onRemove) { const b = attRemoveBtn(a, opts.onRemove); if (b) wrap.appendChild(b); }
       } else {
         const link = document.createElement('a');
         link.className = 'file-link'; link.href = a.url; link.target = '_blank'; link.rel = 'noopener';
         link.textContent = '📎 ' + (a.name || a.url.split('/').pop());
         wrap.appendChild(link);
+        if (opts && opts.onRemove) { const b = attRemoveBtn(a, opts.onRemove); if (b) wrap.appendChild(b); }
       }
     }
     container.appendChild(wrap);
+  }
+
+  // Small "✕ remove" button for an attachment; null for legacy slot attachments (no id).
+  function attRemoveBtn(att, onRemove) {
+    if (!att.id) return null;
+    const b = document.createElement('button');
+    b.type = 'button'; b.className = 'att-rm'; b.title = 'Remove this attachment'; b.textContent = '✕ remove';
+    b.addEventListener('click', () => onRemove(att));
+    return b;
+  }
+
+  // Build one tracking note card. opts: { onEdit, onDelete, showArchiveToggle, extraMeta?, editing? }
+  function buildTrackingCard(n, opts) {
+    const li = document.createElement('li'); li.className = 'note';
+    if (n.image) {
+      const img = document.createElement('img'); img.className = 'thumb'; img.src = n.image; img.alt = '';
+      img.style.cursor = 'zoom-in';
+      img.addEventListener('click', () => openLightbox(n.image));
+      li.appendChild(img);
+    }
+    const body = document.createElement('div'); body.className = 'body';
+    const meta = document.createElement('div'); meta.className = 'meta';
+    const badge = document.createElement('span'); badge.className = 'badge'; badge.textContent = n.date; meta.appendChild(badge);
+    if (n.expect_end_date) {
+      const e = document.createElement('span'); e.className = 'end-badge';
+      e.textContent = '🏁 ends ' + n.expect_end_date;
+      e.title = 'Expected end date';
+      meta.appendChild(e);
+    }
+    if (opts.extraMeta) opts.extraMeta(meta);
+    if (n.created_at) { const c = document.createElement('span'); c.className = 'created'; c.textContent = new Date(n.created_at).toLocaleString(); meta.appendChild(c); }
+    body.appendChild(meta);
+    if (n.note) { const p = document.createElement('p'); p.className = 'text'; p.textContent = n.note; body.appendChild(p); }
+    renderAttachments(body, n.attachments, opts.editing ? { onRemove: (att) => pendingRemoveTracking(n.id, att) } : null);
+    li.appendChild(body);
+    const actions = document.createElement('div'); actions.className = 'note-actions';
+    if (opts.onEdit) {
+      const edit = document.createElement('button'); edit.className = 'edit'; edit.type = 'button'; edit.textContent = 'Edit';
+      edit.addEventListener('click', () => opts.onEdit(n.id));
+      actions.appendChild(edit);
+    }
+    if (opts.showArchiveToggle) {
+      const arch = document.createElement('button');
+      arch.className = 'arch'; arch.type = 'button';
+      arch.textContent = n.archived ? '↩ Unarchive' : '🗄 Archive';
+      arch.title = n.archived ? 'Move this record back to Note Tracking' : 'Move this record to the Archive page';
+      arch.addEventListener('click', () => toggleArchive(n.id));
+      actions.appendChild(arch);
+    }
+    if (opts.onDelete) {
+      const del = document.createElement('button'); del.className = 'del'; del.type = 'button'; del.textContent = 'Delete';
+      del.addEventListener('click', () => opts.onDelete(n.id));
+      actions.appendChild(del);
+    }
+    li.appendChild(actions);
+    return li;
   }
 
   /* =====================================================================
      TRACKING FEATURE
      ===================================================================== */
   const trDate = $('tr-date'), trNote = $('tr-note'), trImage = $('tr-image');
+  const trExpectEnd = $('tr-expect-end');
   const trVoice = $('tr-voice'), trVideo = $('tr-video'), trFile = $('tr-file');
-  const trPreview = $('tr-preview'), trStatus = $('tr-status');
+  const trStatus = $('tr-status');
   const trList = $('tr-notes'), trCount = $('tr-count'), trEmpty = $('tr-empty');
   const trSearch = $('tr-search'), trClear = $('tr-clear');
   let trAll = [];
 
+  const trImgPrev = $('tr-img-prev');
   trDate.value = todayStr();
-  bindImagePreview(trImage, trPreview);
+  bindImagePreview(trImage, trImgPrev);
   bindAttachPreview(trVoice, $('tr-voice-prev'), 'audio');
   bindAttachPreview(trVideo, $('tr-video-prev'), 'video');
   bindAttachPreview(trFile, $('tr-file-prev'), 'file');
 
-  // Collect the attachments chosen for a tracking record.
+  // Collect the attachments chosen for a tracking record (multiple per type).
   function trAttachments() {
     const out = [];
-    if (trVoice.files && trVoice.files[0]) out.push({ type: 'audio', file: trVoice.files[0] });
-    if (trVideo.files && trVideo.files[0]) out.push({ type: 'video', file: trVideo.files[0] });
-    if (trFile.files && trFile.files[0]) out.push({ type: 'file', file: trFile.files[0] });
+    for (const f of Array.from(trImage.files || [])) out.push({ type: 'image', file: f });
+    for (const f of Array.from(trVoice.files || [])) out.push({ type: 'audio', file: f });
+    for (const f of Array.from(trVideo.files || [])) out.push({ type: 'video', file: f });
+    for (const f of Array.from(trFile.files || [])) out.push({ type: 'file', file: f });
     return out;
+  }
+
+  // Pending attachment removals during edit, applied when the form is saved.
+  const trPendingRemove = new Map(); // noteId -> Set of attachment ids (or legacy filenames)
+
+  function pendingRemoveTracking(noteId, att) {
+    let set = trPendingRemove.get(noteId);
+    if (!set) { set = new Set(); trPendingRemove.set(noteId, set); }
+    const key = att.id != null ? String(att.id) : att.url.split('/').pop();
+    if (set.has(key)) {
+      // Toggle back: un-remove.
+      set.delete(key);
+      if (set.size === 0) trPendingRemove.delete(noteId);
+    } else {
+      set.add(key);
+    }
+    const n = trAll.find((x) => x.id === noteId);
+    renderTracking(filterTracking(trSearch.value), trSearch.value);
+    if (n) renderTrCurrentAtts(n); // refresh the form's "current" boxes too
+  }
+
+  function isTrPendingRemove(noteId, att) {
+    const set = trPendingRemove.get(noteId);
+    if (!set) return false;
+    return set.has(att.id != null ? String(att.id) : att.url.split('/').pop());
   }
 
   function renderTracking(notes, term) {
@@ -404,31 +582,22 @@
     trEmpty.textContent = hasAny && notes.length === 0
       ? `No records match "${term}".` : 'No records yet. Add your first one above.';
     for (const n of notes) {
-      const li = document.createElement('li'); li.className = 'note';
-      if (n.image) { const img = document.createElement('img'); img.className = 'thumb'; img.src = n.image; img.alt = ''; li.appendChild(img); }
-      const body = document.createElement('div'); body.className = 'body';
-      const meta = document.createElement('div'); meta.className = 'meta';
-      const badge = document.createElement('span'); badge.className = 'badge'; badge.textContent = n.date; meta.appendChild(badge);
-      if (n.created_at) { const c = document.createElement('span'); c.className = 'created'; c.textContent = new Date(n.created_at).toLocaleString(); meta.appendChild(c); }
-      body.appendChild(meta);
-      if (n.note) { const p = document.createElement('p'); p.className = 'text'; p.textContent = n.note; body.appendChild(p); }
-      renderAttachments(body, n.attachments);
-      li.appendChild(body);
-      const actions = document.createElement('div'); actions.className = 'note-actions';
-      const edit = document.createElement('button'); edit.className = 'edit'; edit.type = 'button'; edit.textContent = 'Edit';
-      edit.addEventListener('click', () => startEditTracking(n.id));
-      const del = document.createElement('button'); del.className = 'del'; del.type = 'button'; del.textContent = 'Delete';
-      del.addEventListener('click', () => removeTracking(n.id));
-      actions.append(edit, del);
-      li.appendChild(actions);
-      trList.appendChild(li);
+      trList.appendChild(buildTrackingCard(n, {
+        onEdit: startEditTracking,
+        onDelete: removeTracking,
+        showArchiveToggle: true,
+        editing: trEditingId === n.id,
+      }));
     }
   }
 
   function filterTracking(term) {
     const t = term.trim().toLowerCase();
-    if (!t) return trAll;
-    return trAll.filter((n) => (n.note && n.note.toLowerCase().includes(t)) || (n.date && n.date.toLowerCase().includes(t)));
+    return trAll.filter((n) => {
+      if (n.archived) return false; // archived records live on the Archive page
+      if (!t) return true;
+      return (n.note && n.note.toLowerCase().includes(t)) || (n.date && n.date.toLowerCase().includes(t));
+    });
   }
 
   async function loadTracking() {
@@ -437,6 +606,8 @@
       if (!res.ok) throw new Error('HTTP ' + res.status);
       trAll = (await res.json()).notes || [];
       renderTracking(filterTracking(trSearch.value), trSearch.value);
+      renderEndingSoon();
+      renderArchive();
     } catch (e) { setStatus(trStatus, 'Failed to load: ' + e.message, 'err'); }
   }
 
@@ -449,10 +620,89 @@
     } catch (e) { setStatus(trStatus, 'Delete failed: ' + e.message, 'err'); }
   }
 
+  /* ---- Archive / unarchive (tracking notes only) ---- */
+  async function toggleArchive(id) {
+    const n = trAll.find((x) => x.id === id);
+    if (!n) return;
+    try {
+      const res = await fetch('/api/notes/' + id + '/archive', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ archived: !n.archived }),
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      await loadTracking();
+    } catch (e) { setStatus(trStatus, 'Archive failed: ' + e.message, 'err'); }
+  }
+
+  /* =====================================================================
+     ENDING SOON (tracking notes expected to end within the next 7 days)
+     ===================================================================== */
+  const esList = $('es-notes'), esCount = $('es-count'), esEmpty = $('es-empty');
+
+  function localDateStr(d) {
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+
+  // YYYY-MM-DD string for `days` days from today (local time), inclusive window.
+  function dateWithinDays(days) {
+    const d = new Date();
+    d.setDate(d.getDate() + days);
+    return localDateStr(d);
+  }
+
+  function endingSoonNotes() {
+    const today = localDateStr(new Date());
+    const limit = dateWithinDays(7);
+    // Only non-archived notes with an expected end date between today and +7 days.
+    return trAll
+      .filter((n) => !n.archived && n.expect_end_date && n.expect_end_date >= today && n.expect_end_date <= limit)
+      .sort((a, b) => a.expect_end_date.localeCompare(b.expect_end_date));
+  }
+
+  function renderEndingSoon() {
+    const notes = endingSoonNotes();
+    esList.innerHTML = '';
+    esCount.textContent = notes.length ? `${notes.length} record${notes.length === 1 ? '' : 's'}` : '';
+    esEmpty.hidden = notes.length > 0;
+    for (const n of notes) {
+      const extra = (meta) => {
+        const daysLeft = Math.round((new Date(n.expect_end_date + 'T00:00:00') - new Date(localDateStr(new Date()) + 'T00:00:00')) / 86400000);
+        const d = document.createElement('span'); d.className = 'end-badge soon';
+        d.textContent = daysLeft <= 0 ? 'ends today' : (daysLeft === 1 ? 'ends tomorrow' : `ends in ${daysLeft} days`);
+        meta.appendChild(d);
+      };
+      esList.appendChild(buildTrackingCard(n, {
+        onEdit: startEditTracking,
+        onDelete: removeTracking,
+        showArchiveToggle: true,
+        extraMeta: extra,
+        editing: trEditingId === n.id,
+      }));
+    }
+  }
+
+  /* =====================================================================
+     ARCHIVE (archived tracking notes)
+     ===================================================================== */
+  const arList = $('ar-notes'), arCount = $('ar-count'), arEmpty = $('ar-empty');
+
+  function renderArchive() {
+    const notes = trAll.filter((n) => n.archived).sort((a, b) => (b.date || '').localeCompare(a.date || '') || b.id - a.id);
+    arList.innerHTML = '';
+    arCount.textContent = notes.length ? `${notes.length} record${notes.length === 1 ? '' : 's'}` : '';
+    arEmpty.hidden = notes.length > 0;
+    for (const n of notes) {
+      arList.appendChild(buildTrackingCard(n, {
+        onEdit: startEditTracking,
+        onDelete: removeTracking,
+        showArchiveToggle: true, // shows "Unarchive" — returns it to Note Tracking
+        editing: trEditingId === n.id,
+      }));
+    }
+  }
+
   /* ---- Edit a tracking record ---- */
   let trEditingId = null; // id of the record currently being edited, or null
-  // Per slot: { mode: 'keep'|'remove', name, url } describing the CURRENT attachment.
-  let trCurrentAtts = {};
 
   function setTrEditUI(on) {
     $('tr-save').textContent = on ? 'Save changes' : 'Add record';
@@ -460,79 +710,78 @@
     $('tracking-form').classList.toggle('editing', !!on);
   }
 
-  // Render a "current attachment" box for a slot: keep by default, with remove / replace.
-  function renderTrSlotBox(boxEl, inputEl, info) {
-    boxEl.innerHTML = '';
-    if (!info || !info.mode) return;
-    const fname = document.createElement('div'); fname.className = 'fname';
-    const span = document.createElement('span');
-    span.textContent = (info.mode === 'keep' ? 'Current: ' : 'Will be removed') + ' ' + (info.name || '');
-    const rm = document.createElement('button'); rm.type = 'button'; rm.className = 'rm';
-    rm.textContent = info.mode === 'keep' ? '✕ remove' : '↺ keep';
-    rm.addEventListener('click', () => {
-      if (info.mode === 'keep') {
-        info.mode = 'remove'; span.textContent = 'Will be removed: ' + (info.name || ''); rm.textContent = '↺ keep';
+  // Show current attachments in the form's preview boxes.
+  // Current items can be removed with ✕ (pending until Save); pending-removed ones show a restore link.
+  function renderTrCurrentAtts(n) {
+    for (const k of ['tr-voice-prev', 'tr-video-prev', 'tr-file-prev']) { $(k).innerHTML = ''; $(k).style.display = 'none'; }
+    trImgPrev.innerHTML = '';
+    const atts = n.attachments || [];
+    // Current images: thumbnail + ✕ remove (pending until Save).
+    for (const a of atts.filter((x) => x.type === 'image')) {
+      const pending = isTrPendingRemove(n.id, a);
+      const box = document.createElement('div'); box.className = 'img-thumb' + (pending ? ' removed' : '');
+      const img = document.createElement('img'); img.src = a.url; img.alt = a.name || 'image';
+      if (pending) {
+        const tag = document.createElement('span');
+        tag.style.cssText = 'position:absolute;left:0;right:0;bottom:0;background:rgba(220,38,38,.85);color:#fff;font-size:.6rem;text-align:center;padding:1px 0;';
+        tag.textContent = 'will be removed';
+        box.append(img, tag);
       } else {
-        info.mode = 'keep'; span.textContent = 'Current: ' + (info.name || ''); rm.textContent = '✕ remove';
+        const rm = document.createElement('button'); rm.type = 'button'; rm.className = 'rm'; rm.title = 'Remove this image (applies when you save)'; rm.innerHTML = '&times;';
+        rm.addEventListener('click', () => pendingRemoveTracking(n.id, a));
+        box.append(img, rm);
       }
-    });
-    fname.append(span, rm);
-    if (info.url && info.type === 'audio') { const a = document.createElement('audio'); a.controls = true; a.src = info.url; boxEl.appendChild(a); }
-    else if (info.url && info.type === 'video') { const v = document.createElement('video'); v.controls = true; v.src = info.url; boxEl.appendChild(v); }
-    boxEl.appendChild(fname);
-    boxEl.style.display = 'flex';
+      trImgPrev.appendChild(box);
+    }
+    // Current audio/video/file rows.
+    const byType = { audio: [], video: [], file: [] };
+    for (const a of atts) if (byType[a.type]) byType[a.type].push(a);
+    const boxes = { audio: $('tr-voice-prev'), video: $('tr-video-prev'), file: $('tr-file-prev') };
+    for (const kind of ['audio', 'video', 'file']) {
+      const boxEl = boxes[kind];
+      if (!byType[kind].length) continue;
+      for (const a of byType[kind]) {
+        const pending = isTrPendingRemove(n.id, a);
+        if (kind === 'audio' && !pending) { const el = document.createElement('audio'); el.controls = true; el.src = a.url; boxEl.appendChild(el); }
+        else if (kind === 'video' && !pending) { const el = document.createElement('video'); el.controls = true; el.src = a.url; boxEl.appendChild(el); }
+        const fname = document.createElement('div'); fname.className = 'fname';
+        const span = document.createElement('span');
+        span.textContent = (pending ? 'Will be removed: ' : 'Current: ') + (a.name || a.url.split('/').pop());
+        if (pending) span.style.color = 'var(--danger)';
+        fname.appendChild(span);
+        const btn = document.createElement('button'); btn.type = 'button'; btn.className = 'rm';
+        btn.textContent = pending ? '↺ keep' : '✕ remove';
+        btn.addEventListener('click', () => pendingRemoveTracking(n.id, a));
+        fname.appendChild(btn);
+        boxEl.appendChild(fname);
+      }
+      boxEl.style.display = 'flex';
+    }
   }
 
   function startEditTracking(id) {
     const n = trAll.find((x) => x.id === id);
     if (!n) return;
     trEditingId = id;
+    trPendingRemove.delete(id); // fresh edit session: no pending removals
     trDate.value = n.date || todayStr();
+    trExpectEnd.value = n.expect_end_date || '';
     trNote.value = n.note || '';
-    // Reset all file inputs + previews, then describe current attachments.
+    // File inputs start empty (for NEW files); current attachments are shown with remove buttons.
     trImage.value = ''; trVoice.value = ''; trVideo.value = ''; trFile.value = '';
-    trPreview.style.display = 'none'; trPreview.removeAttribute('src');
-    for (const k of ['tr-voice-prev', 'tr-video-prev', 'tr-file-prev']) { $(k).innerHTML = ''; $(k).style.display = 'none'; }
-
-    // Current image: show it as the preview.
-    trCurrentAtts = {};
-    if (n.image) {
-      trPreview.src = n.image; trPreview.style.display = 'block';
-      trCurrentAtts.image = { mode: 'keep', name: n.image.split('/').pop(), url: n.image, type: 'image' };
-    } else {
-      trCurrentAtts.image = { mode: null };
-    }
-    // Current voice/video/file attachments.
-    for (const a of n.attachments || []) {
-      const info = { mode: 'keep', name: a.name || a.url.split('/').pop(), url: a.url, type: a.type };
-      if (a.type === 'audio') { trCurrentAtts.voice = info; renderTrSlotBox($('tr-voice-prev'), trVoice, info); }
-      else if (a.type === 'video') { trCurrentAtts.video = info; renderTrSlotBox($('tr-video-prev'), trVideo, info); }
-      else { trCurrentAtts.file = info; renderTrSlotBox($('tr-file-prev'), trFile, info); }
-    }
+    renderTrCurrentAtts(n);
     setTrEditUI(true);
     $('tracking-form').scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
   function cancelEditTracking() {
-    trEditingId = null; trCurrentAtts = {};
-    trDate.value = todayStr(); trNote.value = '';
+    if (trEditingId !== null) trPendingRemove.delete(trEditingId); // discard pending removals
+    trEditingId = null;
+    trDate.value = todayStr(); trExpectEnd.value = ''; trNote.value = '';
     trImage.value = ''; trVoice.value = ''; trVideo.value = ''; trFile.value = '';
-    trPreview.style.display = 'none'; trPreview.removeAttribute('src');
+    trImgPrev.innerHTML = '';
     for (const k of ['tr-voice-prev', 'tr-video-prev', 'tr-file-prev']) { $(k).innerHTML = ''; $(k).style.display = 'none'; }
     setTrEditUI(false);
-  }
-
-  // Build the slot instructions for a PATCH: new upload > keep/remove decision.
-  function trSlotInstructions() {
-    const out = {};
-    const slots = { image: trImage, voice: trVoice, video: trVideo, file: trFile };
-    for (const key of ['image', 'voice', 'video', 'file']) {
-      const cur = trCurrentAtts[key];
-      if (slots[key].files && slots[key].files[0]) continue; // new upload present -> no slot field needed
-      if (!cur || !cur.mode) continue;                        // nothing current, nothing chosen
-      out[key + '_slot'] = cur.mode === 'keep' ? 'keep' : '';
-    }
-    return out;
   }
 
   $('tr-cancel').addEventListener('click', cancelEditTracking);
@@ -544,18 +793,19 @@
     try {
       const fd = new FormData();
       fd.append('date', trDate.value);
+      fd.append('expect_end_date', trExpectEnd.value || '');
       fd.append('note', trNote.value.trim());
-      if (trImage.files && trImage.files[0]) fd.append('image', trImage.files[0]);
       for (const a of trAttachments()) fd.append(a.type, a.file);
       if (isEdit) {
-        // Tell the server which current attachments to keep vs remove (slots without a new upload).
-        for (const [k, v] of Object.entries(trSlotInstructions())) fd.append(k, v);
+        // Apply pending removals on save.
+        const pending = trPendingRemove.get(trEditingId);
+        if (pending && pending.size) fd.append('removed_attachment_ids', [...pending].join(','));
       }
       const res = await fetch(isEdit ? '/api/notes/' + trEditingId : '/api/notes', { method: isEdit ? 'PATCH' : 'POST', body: fd });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
       setStatus(trStatus, isEdit ? 'Record updated.' : 'Record added.', 'ok');
-      cancelEditTracking(); // resets form to the "add" state
+      cancelEditTracking(); // resets form to the "add" state (also clears pending removals)
       loadTracking();
     } catch (e) { setStatus(trStatus, e.message, 'err'); }
     finally { btn.disabled = false; }
@@ -567,27 +817,53 @@
   /* =====================================================================
      TAKING FEATURE (tags + auto timestamp)
      ===================================================================== */
-  const tkNote = $('tk-note'), tkImage = $('tk-image'), tkPreview = $('tk-preview');
+  const tkNote = $('tk-note'), tkImage = $('tk-image');
   const tkVoice = $('tk-voice'), tkVideo = $('tk-video'), tkFile = $('tk-file');
   const tkStatus = $('tk-status'), tkTagsEl = $('tk-tags');
   const tkList = $('tk-notes'), tkCount = $('tk-count'), tkEmpty = $('tk-empty');
   const tkSearch = $('tk-search'), tkClear = $('tk-clear'), tkFilterEl = $('tk-filter');
+  const tkImgPrev = $('tk-img-prev');
   let tkAll = [];
   let allTags = [];            // every known tag name
   const selectedTags = new Set();   // tags chosen for the note being created
   const filterTags = new Set();     // active tag filters
 
-  bindImagePreview(tkImage, tkPreview);
+  bindImagePreview(tkImage, tkImgPrev);
   bindAttachPreview(tkVoice, $('tk-voice-prev'), 'audio');
   bindAttachPreview(tkVideo, $('tk-video-prev'), 'video');
   bindAttachPreview(tkFile, $('tk-file-prev'), 'file');
 
   function tkAttachments() {
     const out = [];
-    if (tkVoice.files && tkVoice.files[0]) out.push({ type: 'audio', file: tkVoice.files[0] });
-    if (tkVideo.files && tkVideo.files[0]) out.push({ type: 'video', file: tkVideo.files[0] });
-    if (tkFile.files && tkFile.files[0]) out.push({ type: 'file', file: tkFile.files[0] });
+    for (const f of Array.from(tkImage.files || [])) out.push({ type: 'image', file: f });
+    for (const f of Array.from(tkVoice.files || [])) out.push({ type: 'audio', file: f });
+    for (const f of Array.from(tkVideo.files || [])) out.push({ type: 'video', file: f });
+    for (const f of Array.from(tkFile.files || [])) out.push({ type: 'file', file: f });
     return out;
+  }
+
+  // Pending attachment removals during edit, applied when the form is saved.
+  const tkPendingRemove = new Map(); // noteId -> Set of attachment ids (or legacy filenames)
+
+  function pendingRemoveTaking(noteId, att) {
+    let set = tkPendingRemove.get(noteId);
+    if (!set) { set = new Set(); tkPendingRemove.set(noteId, set); }
+    const key = att.id != null ? String(att.id) : att.url.split('/').pop();
+    if (set.has(key)) {
+      set.delete(key);
+      if (set.size === 0) tkPendingRemove.delete(noteId);
+    } else {
+      set.add(key);
+    }
+    renderTaking(filterTaking(tkSearch.value), tkSearch.value);
+    const n = tkAll.find((x) => x.id === noteId);
+    if (n) renderTkCurrentAtts(n); // refresh the form's "current" boxes too
+  }
+
+  function isTkPendingRemove(noteId, att) {
+    const set = tkPendingRemove.get(noteId);
+    if (!set) return false;
+    return set.has(att.id != null ? String(att.id) : att.url.split('/').pop());
   }
 
   async function removeTagFromList(name) {
@@ -675,14 +951,19 @@
     tkEmpty.textContent = hasAny && notes.length === 0 ? 'No notes match your search/filter.' : 'No notes yet. Add your first one above.';
     for (const n of notes) {
       const li = document.createElement('li'); li.className = 'note';
-      if (n.image) { const img = document.createElement('img'); img.className = 'thumb'; img.src = n.image; img.alt = ''; li.appendChild(img); }
+      if (n.image) {
+        const img = document.createElement('img'); img.className = 'thumb'; img.src = n.image; img.alt = '';
+        img.style.cursor = 'zoom-in';
+        img.addEventListener('click', () => openLightbox(n.image));
+        li.appendChild(img);
+      }
       const body = document.createElement('div'); body.className = 'body';
       const meta = document.createElement('div'); meta.className = 'meta';
       if (n.created_at) { const c = document.createElement('span'); c.className = 'created'; c.textContent = new Date(n.created_at).toLocaleString(); meta.appendChild(c); }
       for (const tag of n.tags) { const p = document.createElement('span'); p.className = 'tag-pill'; p.textContent = '#' + tag; meta.appendChild(p); }
       body.appendChild(meta);
       if (n.note) { const p = document.createElement('p'); p.className = 'text'; p.textContent = n.note; body.appendChild(p); }
-      renderAttachments(body, n.attachments);
+      renderAttachments(body, n.attachments, tkEditingId === n.id ? { onRemove: (att) => pendingRemoveTaking(n.id, att) } : null);
       li.appendChild(body);
       const actions = document.createElement('div'); actions.className = 'note-actions';
       const edit = document.createElement('button'); edit.className = 'edit'; edit.type = 'button'; edit.textContent = 'Edit';
@@ -720,7 +1001,6 @@
 
   /* ---- Edit a taking note ---- */
   let tkEditingId = null;
-  let tkCurrentAtts = {};
 
   function setTkEditUI(on) {
     $('tk-save').textContent = on ? 'Save changes' : 'Add note';
@@ -728,79 +1008,80 @@
     $('taking-form').classList.toggle('editing', !!on);
   }
 
-  function renderTkSlotBox(boxEl, info) {
-    boxEl.innerHTML = '';
-    if (!info || !info.mode) return;
-    const fname = document.createElement('div'); fname.className = 'fname';
-    const span = document.createElement('span');
-    span.textContent = (info.mode === 'keep' ? 'Current: ' : 'Will be removed') + ' ' + (info.name || '');
-    const rm = document.createElement('button'); rm.type = 'button'; rm.className = 'rm';
-    rm.textContent = info.mode === 'keep' ? '✕ remove' : '↺ keep';
-    rm.addEventListener('click', () => {
-      if (info.mode === 'keep') {
-        info.mode = 'remove'; span.textContent = 'Will be removed: ' + (info.name || ''); rm.textContent = '↺ keep';
+  // Show current attachments in the form's preview boxes.
+  // Current items can be removed with ✕ (pending until Save); pending-removed ones show a restore link.
+  function renderTkCurrentAtts(n) {
+    for (const k of ['tk-voice-prev', 'tk-video-prev', 'tk-file-prev']) { $(k).innerHTML = ''; $(k).style.display = 'none'; }
+    tkImgPrev.innerHTML = '';
+    const atts = n.attachments || [];
+    for (const a of atts.filter((x) => x.type === 'image')) {
+      const pending = isTkPendingRemove(n.id, a);
+      const box = document.createElement('div'); box.className = 'img-thumb' + (pending ? ' removed' : '');
+      const img = document.createElement('img'); img.src = a.url; img.alt = a.name || 'image';
+      if (pending) {
+        const tag = document.createElement('span');
+        tag.style.cssText = 'position:absolute;left:0;right:0;bottom:0;background:rgba(220,38,38,.85);color:#fff;font-size:.6rem;text-align:center;padding:1px 0;';
+        tag.textContent = 'will be removed';
+        box.append(img, tag);
       } else {
-        info.mode = 'keep'; span.textContent = 'Current: ' + (info.name || ''); rm.textContent = '✕ remove';
+        const rm = document.createElement('button'); rm.type = 'button'; rm.className = 'rm'; rm.title = 'Remove this image (applies when you save)'; rm.innerHTML = '&times;';
+        rm.addEventListener('click', () => pendingRemoveTaking(n.id, a));
+        box.append(img, rm);
       }
-    });
-    fname.append(span, rm);
-    if (info.url && info.type === 'audio') { const a = document.createElement('audio'); a.controls = true; a.src = info.url; boxEl.appendChild(a); }
-    else if (info.url && info.type === 'video') { const v = document.createElement('video'); v.controls = true; v.src = info.url; boxEl.appendChild(v); }
-    boxEl.appendChild(fname);
-    boxEl.style.display = 'flex';
+      tkImgPrev.appendChild(box);
+    }
+    const byType = { audio: [], video: [], file: [] };
+    for (const a of atts) if (byType[a.type]) byType[a.type].push(a);
+    const boxes = { audio: $('tk-voice-prev'), video: $('tk-video-prev'), file: $('tk-file-prev') };
+    for (const kind of ['audio', 'video', 'file']) {
+      const boxEl = boxes[kind];
+      if (!byType[kind].length) continue;
+      for (const a of byType[kind]) {
+        const pending = isTkPendingRemove(n.id, a);
+        if (kind === 'audio' && !pending) { const el = document.createElement('audio'); el.controls = true; el.src = a.url; boxEl.appendChild(el); }
+        else if (kind === 'video' && !pending) { const el = document.createElement('video'); el.controls = true; el.src = a.url; boxEl.appendChild(el); }
+        const fname = document.createElement('div'); fname.className = 'fname';
+        const span = document.createElement('span');
+        span.textContent = (pending ? 'Will be removed: ' : 'Current: ') + (a.name || a.url.split('/').pop());
+        if (pending) span.style.color = 'var(--danger)';
+        fname.appendChild(span);
+        const btn = document.createElement('button'); btn.type = 'button'; btn.className = 'rm';
+        btn.textContent = pending ? '↺ keep' : '✕ remove';
+        btn.addEventListener('click', () => pendingRemoveTaking(n.id, a));
+        fname.appendChild(btn);
+        boxEl.appendChild(fname);
+      }
+      boxEl.style.display = 'flex';
+    }
   }
 
   function startEditTaking(id) {
     const n = tkAll.find((x) => x.id === id);
     if (!n) return;
     tkEditingId = id;
+    tkPendingRemove.delete(id); // fresh edit session: no pending removals
     tkNote.value = n.note || '';
     tkImage.value = ''; tkVoice.value = ''; tkVideo.value = ''; tkFile.value = '';
-    tkPreview.style.display = 'none'; tkPreview.removeAttribute('src');
-    for (const k of ['tk-voice-prev', 'tk-video-prev', 'tk-file-prev']) { $(k).innerHTML = ''; $(k).style.display = 'none'; }
+    renderTkCurrentAtts(n);
 
     // Tags: select the note's current tags.
     selectedTags.clear();
     for (const t of n.tags || []) { if (!allTags.includes(t)) allTags.push(t); selectedTags.add(t); }
     renderTagPicker();
 
-    tkCurrentAtts = {};
-    if (n.image) {
-      tkPreview.src = n.image; tkPreview.style.display = 'block';
-      tkCurrentAtts.image = { mode: 'keep', name: n.image.split('/').pop(), url: n.image, type: 'image' };
-    } else {
-      tkCurrentAtts.image = { mode: null };
-    }
-    for (const a of n.attachments || []) {
-      const info = { mode: 'keep', name: a.name || a.url.split('/').pop(), url: a.url, type: a.type };
-      if (a.type === 'audio') { tkCurrentAtts.voice = info; renderTkSlotBox($('tk-voice-prev'), info); }
-      else if (a.type === 'video') { tkCurrentAtts.video = info; renderTkSlotBox($('tk-video-prev'), info); }
-      else { tkCurrentAtts.file = info; renderTkSlotBox($('tk-file-prev'), info); }
-    }
     setTkEditUI(true);
     $('taking-form').scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
   function cancelEditTaking() {
-    tkEditingId = null; tkCurrentAtts = {};
+    if (tkEditingId !== null) tkPendingRemove.delete(tkEditingId); // discard pending removals
+    tkEditingId = null;
     tkNote.value = '';
     tkImage.value = ''; tkVoice.value = ''; tkVideo.value = ''; tkFile.value = '';
-    tkPreview.style.display = 'none'; tkPreview.removeAttribute('src');
+    tkImgPrev.innerHTML = '';
     for (const k of ['tk-voice-prev', 'tk-video-prev', 'tk-file-prev']) { $(k).innerHTML = ''; $(k).style.display = 'none'; }
     selectedTags.clear(); renderTagPicker();
     setTkEditUI(false);
-  }
-
-  function tkSlotInstructions() {
-    const out = {};
-    const slots = { image: tkImage, voice: tkVoice, video: tkVideo, file: tkFile };
-    for (const key of ['image', 'voice', 'video', 'file']) {
-      const cur = tkCurrentAtts[key];
-      if (slots[key].files && slots[key].files[0]) continue;
-      if (!cur || !cur.mode) continue;
-      out[key + '_slot'] = cur.mode === 'keep' ? 'keep' : '';
-    }
-    return out;
   }
 
   $('tk-cancel').addEventListener('click', cancelEditTaking);
@@ -813,16 +1094,17 @@
       const fd = new FormData();
       fd.append('note', tkNote.value.trim());
       fd.append('tags', [...selectedTags].join(','));
-      if (tkImage.files && tkImage.files[0]) fd.append('image', tkImage.files[0]);
       for (const a of tkAttachments()) fd.append(a.type, a.file);
       if (isEdit) {
-        for (const [k, v] of Object.entries(tkSlotInstructions())) fd.append(k, v);
+        // Apply pending removals on save.
+        const pending = tkPendingRemove.get(tkEditingId);
+        if (pending && pending.size) fd.append('removed_attachment_ids', [...pending].join(','));
       }
       const res = await fetch(isEdit ? '/api/taking/' + tkEditingId : '/api/taking', { method: isEdit ? 'PATCH' : 'POST', body: fd });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
       setStatus(tkStatus, isEdit ? 'Note updated.' : 'Note added.', 'ok');
-      cancelEditTaking(); // resets form to the "add" state
+      cancelEditTaking(); // resets form to the "add" state (also clears pending removals)
       loadTaking();
     } catch (e) { setStatus(tkStatus, e.message, 'err'); }
     finally { btn.disabled = false; }
@@ -874,22 +1156,25 @@
   }
 
   // Map a note's attachments to bare filenames (+ content hashes when known) for sync.
+  // The legacy image slot maps to `image`; everything else goes into the `attachments` list.
   function attFilenames(n) {
-    const out = {};
+    const out = { attachments: [] };
     for (const a of n.attachments || []) {
       const name = a.url.split('/').pop();
-      if (a.type === 'audio') { out.voice = name; if (a.hash) out.voice_hash = a.hash; }
-      else if (a.type === 'video') { out.video = name; if (a.hash) out.video_hash = a.hash; }
-      else if (a.type === 'file') { out.file = name; if (a.hash) out.file_hash = a.hash; }
+      if (a.primary) {
+        out.image = name;
+        if (a.hash) out.image_hash = a.hash;
+      } else {
+        out.attachments.push({ type: a.type, name, hash: a.hash || '' });
+      }
     }
-    if (n.image) { out.image = n.image.split('/').pop(); if (n.image_hash) out.image_hash = n.image_hash; }
     return out;
   }
 
   // Gather this device's records in a portable shape (filenames, not URLs).
   function localRecords() {
-    const tr = trAll.map((n) => Object.assign({ date: n.date, note: n.note, created_at: n.created_at }, attFilenames(n)));
-    const tk = tkAll.map((n) => Object.assign({ note: n.note, created_at: n.created_at, tags: n.tags || [] }, attFilenames(n)));
+    const tr = trAll.map((n) => Object.assign({ uuid: n.uuid || null, date: n.date, note: n.note, created_at: n.created_at, expect_end_date: n.expect_end_date || null, archived: !!n.archived }, attFilenames(n)));
+    const tk = tkAll.map((n) => Object.assign({ uuid: n.uuid || null, note: n.note, created_at: n.created_at, tags: n.tags || [] }, attFilenames(n)));
     return { tracking: tr, taking: tk, tags: allTags };
   }
 
@@ -952,16 +1237,20 @@
       return dlCache[name];
     }
     const tracking = (data.tracking || []).map(async (n) => ({
-      date: n.date, note: n.note, created_at: n.created_at,
-      image: await localFor(n.image, n.image_hash), voice: await localFor(n.voice, n.voice_hash),
-      video: await localFor(n.video, n.video_hash), file: await localFor(n.file, n.file_hash),
-      image_hash: n.image_hash, voice_hash: n.voice_hash, video_hash: n.video_hash, file_hash: n.file_hash,
+      uuid: n.uuid || null,
+      date: n.date, note: n.note, created_at: n.created_at, expect_end_date: n.expect_end_date || null,
+      image: await localFor(n.image, n.image_hash),
+      // Download EVERY attachment to this device (not just the legacy image slot), so all
+      // images/files are actually viewable after the pull.
+      attachments: await Promise.all((n.attachments || []).map(async (a) => ({ type: a.type, name: await localFor(a.name, a.hash), hash: a.hash || '' }))),
+      image_hash: n.image_hash,
     }));
     const taking = (data.taking || []).map(async (n) => ({
+      uuid: n.uuid || null,
       note: n.note, created_at: n.created_at, tags: n.tags || [],
-      image: await localFor(n.image, n.image_hash), voice: await localFor(n.voice, n.voice_hash),
-      video: await localFor(n.video, n.video_hash), file: await localFor(n.file, n.file_hash),
-      image_hash: n.image_hash, voice_hash: n.voice_hash, video_hash: n.video_hash, file_hash: n.file_hash,
+      image: await localFor(n.image, n.image_hash),
+      attachments: await Promise.all((n.attachments || []).map(async (a) => ({ type: a.type, name: await localFor(a.name, a.hash), hash: a.hash || '' }))),
+      image_hash: n.image_hash,
     }));
     const [tr, tk] = await Promise.all([Promise.all(tracking), Promise.all(taking)]);
 
@@ -981,9 +1270,8 @@
     const map = {}; // localName -> { name, hash }
     const wanted = new Set();
     for (const n of records || []) {
-      for (const key of ['image', 'voice', 'video', 'file']) {
-        if (n[key]) wanted.add(n[key]);
-      }
+      if (n.image) wanted.add(n.image);
+      for (const a of n.attachments || []) if (a.name) wanted.add(a.name);
     }
     for (const name of wanted) {
       // The file lives on THIS device; fetch it locally, then upload to the hub.
@@ -1007,12 +1295,13 @@
       const map = await uploadRecordAttachments(base, [...records.tracking, ...records.taking]);
       for (const list of [records.tracking, records.taking]) {
         for (const n of list) {
-          for (const key of ['image', 'voice', 'video', 'file']) {
-            const entry = n[key] ? map[n[key]] : null; // capture BEFORE rewriting n[key]
-            if (entry) {
-              n[key] = entry.name;
-              if (entry.hash) n[key + '_hash'] = entry.hash;
-            }
+          if (n.image) {
+            const entry = map[n.image];
+            if (entry) { n.image = entry.name; if (entry.hash) n.image_hash = entry.hash; }
+          }
+          for (const a of n.attachments || []) {
+            const entry = map[a.name];
+            if (entry) { a.name = entry.name; if (entry.hash) a.hash = entry.hash; }
           }
         }
       }
